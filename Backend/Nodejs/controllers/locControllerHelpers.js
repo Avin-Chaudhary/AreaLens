@@ -472,6 +472,427 @@ exports.processDataOverpass = async (latC, lonC, data_raw) => {
   return output;
 };
 
+exports.processDataOverpassForChatbot = async (latC, lonC, data_raw) => {
+  try {
+    const elements = data_raw?.elements || [];
+
+    // ---------------------------------------------------------
+    // CONFIG
+    // ---------------------------------------------------------
+
+    // Maximum number of places retained for each category.
+    // We keep the nearest ones because they are usually most
+    // useful for answering location-based questions.
+    const MAX_PER_CATEGORY = 30;
+
+    // Maximum total places in chatbot context.
+    // Prevents a huge 10 km query from exploding the prompt.
+    const MAX_TOTAL_PLACES = 200;
+
+    // ---------------------------------------------------------
+    // HELPERS
+    // ---------------------------------------------------------
+
+    const getCoordinates = (el) => {
+      if (el?.type === "node") {
+        return {
+          lat: el.lat ?? null,
+          lon: el.lon ?? null,
+        };
+      }
+
+      if ((el?.type === "way" || el?.type === "relation") && el.center) {
+        return {
+          lat: el.center.lat ?? null,
+          lon: el.center.lon ?? null,
+        };
+      }
+
+      return {
+        lat: null,
+        lon: null,
+      };
+    };
+
+    const cleanString = (value) => {
+      if (typeof value !== "string") return null;
+
+      const cleaned = value.trim();
+
+      return cleaned.length > 0 ? cleaned : null;
+    };
+
+    const getCategory = (tags) => {
+      if (!tags) return "other";
+
+      if (tags.amenity === "hospital") return "hospital";
+      if (tags.amenity === "bank") return "bank";
+      if (tags.amenity === "police") return "police_station";
+      if (tags.amenity === "fire_station") return "fire_station";
+      if (tags.amenity === "restaurant") return "restaurant";
+      if (tags.amenity === "cinema") return "cinema";
+
+      if (tags.highway === "bus_stop") return "bus_stop";
+
+      if (tags.railway === "station") return "railway_station";
+      if (tags.railway === "subway_entrance") return "metro_entrance";
+
+      if (tags.aeroway === "aerodrome") return "airport";
+
+      if (tags.leisure === "fitness_centre") return "gym";
+      if (tags.leisure === "park") return "park";
+
+      if (tags.shop === "mall") return "mall";
+
+      return "other";
+    };
+
+    // Only retain information that can realistically help
+    // the chatbot answer questions.
+    const extractUsefulInfo = (tags) => {
+      const useful = {};
+
+      const fields = [
+        "name",
+        "brand",
+        "operator",
+
+        // Food
+        "cuisine",
+
+        // Address
+        "addr:housenumber",
+        "addr:street",
+        "addr:suburb",
+        "addr:neighbourhood",
+        "addr:city",
+        "addr:postcode",
+
+        // Useful practical information
+        "opening_hours",
+        "phone",
+        "website",
+        "wheelchair",
+      ];
+
+      for (const field of fields) {
+        const value = cleanString(tags?.[field]);
+
+        if (value !== null) {
+          useful[field] = value;
+        }
+      }
+
+      return useful;
+    };
+
+    const makeAddress = (tags) => {
+      if (!tags) return null;
+
+      const parts = [
+        tags["addr:housenumber"],
+        tags["addr:street"],
+        tags["addr:neighbourhood"],
+        tags["addr:suburb"],
+        tags["addr:city"],
+        tags["addr:postcode"],
+      ]
+        .map(cleanString)
+        .filter(Boolean);
+
+      return parts.length > 0 ? parts.join(", ") : null;
+    };
+
+    // ---------------------------------------------------------
+    // SUMMARY
+    // ---------------------------------------------------------
+
+    const summary = {
+      hospitals: 0,
+      banks: 0,
+      police_stations: 0,
+      fire_stations: 0,
+
+      restaurants: 0,
+      cinemas: 0,
+      gyms: 0,
+      parks: 0,
+      shopping_malls: 0,
+
+      bus_stops: 0,
+      metro_entrances: 0,
+      railway_stations: 0,
+
+      airports: 0,
+    };
+
+    // ---------------------------------------------------------
+    // PROCESS ELEMENTS
+    // ---------------------------------------------------------
+
+    const places = [];
+
+    // Prevent duplicate OSM elements.
+    const seen = new Set();
+
+    for (const el of elements) {
+      if (!el?.tags) continue;
+
+      const coords = getCoordinates(el);
+
+      if (coords.lat == null || coords.lon == null) {
+        continue;
+      }
+
+      const tags = el.tags;
+
+      const category = getCategory(tags);
+
+      // Ignore anything outside the categories we explicitly
+      // requested from Overpass.
+      if (category === "other") {
+        continue;
+      }
+
+      // Count every valid place.
+      switch (category) {
+        case "hospital":
+          summary.hospitals++;
+          break;
+
+        case "bank":
+          summary.banks++;
+          break;
+
+        case "police_station":
+          summary.police_stations++;
+          break;
+
+        case "fire_station":
+          summary.fire_stations++;
+          break;
+
+        case "restaurant":
+          summary.restaurants++;
+          break;
+
+        case "cinema":
+          summary.cinemas++;
+          break;
+
+        case "gym":
+          summary.gyms++;
+          break;
+
+        case "park":
+          summary.parks++;
+          break;
+
+        case "mall":
+          summary.shopping_malls++;
+          break;
+
+        case "bus_stop":
+          summary.bus_stops++;
+          break;
+
+        case "metro_entrance":
+          summary.metro_entrances++;
+          break;
+
+        case "railway_station":
+          summary.railway_stations++;
+          break;
+
+        case "airport":
+          summary.airports++;
+          break;
+      }
+
+      // Deduplicate.
+      const uniqueId = `${el.type}:${el.id}`;
+
+      if (seen.has(uniqueId)) {
+        continue;
+      }
+
+      seen.add(uniqueId);
+
+      const distance_km = getDistanceKm(latC, lonC, coords.lat, coords.lon);
+
+      const usefulInfo = extractUsefulInfo(tags);
+
+      // Places without names are usually not useful to an LLM
+      // for questions like "which hospital?".
+      //
+      // BUT counts are already preserved in summary above.
+      if (!usefulInfo.name) {
+        continue;
+      }
+
+      places.push({
+        category,
+        name: usefulInfo.name,
+
+        distance_km: Number(distance_km.toFixed(3)),
+
+        latitude: Number(coords.lat.toFixed(6)),
+        longitude: Number(coords.lon.toFixed(6)),
+
+        ...(usefulInfo.brand && {
+          brand: usefulInfo.brand,
+        }),
+
+        ...(usefulInfo.operator && {
+          operator: usefulInfo.operator,
+        }),
+
+        ...(usefulInfo.cuisine && {
+          cuisine: usefulInfo.cuisine,
+        }),
+
+        ...(makeAddress(tags) && {
+          address: makeAddress(tags),
+        }),
+
+        ...(usefulInfo.opening_hours && {
+          opening_hours: usefulInfo.opening_hours,
+        }),
+
+        ...(usefulInfo.phone && {
+          phone: usefulInfo.phone,
+        }),
+
+        ...(usefulInfo.website && {
+          website: usefulInfo.website,
+        }),
+
+        ...(usefulInfo.wheelchair && {
+          wheelchair: usefulInfo.wheelchair,
+        }),
+      });
+    }
+
+    // ---------------------------------------------------------
+    // SORT BY DISTANCE
+    // ---------------------------------------------------------
+
+    places.sort((a, b) => a.distance_km - b.distance_km);
+
+    // ---------------------------------------------------------
+    // KEEP NEAREST N PLACES PER CATEGORY
+    // ---------------------------------------------------------
+
+    const categoryCount = {};
+
+    const selectedPlaces = [];
+
+    for (const place of places) {
+      const count = categoryCount[place.category] || 0;
+
+      if (count >= MAX_PER_CATEGORY) {
+        continue;
+      }
+
+      if (selectedPlaces.length >= MAX_TOTAL_PLACES) {
+        break;
+      }
+
+      selectedPlaces.push(place);
+
+      categoryCount[place.category] = count + 1;
+    }
+
+    // ---------------------------------------------------------
+    // GROUP PLACES BY CATEGORY
+    // ---------------------------------------------------------
+
+    const placesByCategory = {};
+
+    for (const place of selectedPlaces) {
+      if (!placesByCategory[place.category]) {
+        placesByCategory[place.category] = [];
+      }
+
+      placesByCategory[place.category].push(place);
+    }
+
+    // ---------------------------------------------------------
+    // IMPORTANT DISTANCES
+    // ---------------------------------------------------------
+
+    const railwayDistance = data_raw?.railway_station_distance_km;
+
+    const airportDistance = getNearestAirportDistanceKm(
+      latC,
+      lonC,
+      airportPath,
+    );
+
+    // ---------------------------------------------------------
+    // FINAL CHATBOT DATA
+    // ---------------------------------------------------------
+
+    return {
+      location: {
+        latitude: latC,
+        longitude: lonC,
+      },
+
+      summary,
+
+      important_distances: {
+        nearest_railway_station_km: Number.isFinite(railwayDistance)
+          ? Number(railwayDistance.toFixed(3))
+          : null,
+
+        nearest_airport_km: Number.isFinite(airportDistance)
+          ? Number(airportDistance.toFixed(3))
+          : null,
+      },
+
+      places: placesByCategory,
+
+      metadata: {
+        total_osm_elements_received: elements.length,
+
+        total_named_places_available: places.length,
+
+        total_places_included: selectedPlaces.length,
+
+        max_places_per_category: MAX_PER_CATEGORY,
+
+        max_total_places: MAX_TOTAL_PLACES,
+      },
+    };
+  } catch (err) {
+    console.error("processDataOverpassForChatbot error:", err.message);
+
+    // IMPORTANT:
+    // Never allow chatbot preprocessing to break the main
+    // AreaLens pipeline.
+    return {
+      location: {
+        latitude: latC,
+        longitude: lonC,
+      },
+
+      summary: {},
+
+      important_distances: {
+        nearest_railway_station_km: null,
+        nearest_airport_km: null,
+      },
+
+      places: {},
+
+      metadata: {
+        error: "Chatbot data preprocessing failed",
+      },
+    };
+  }
+};
+
 exports.getCollectedDataAndProcessOwm = async (lat, lon, data) => {
   const r1 = await fetch(
     `https://api.openweathermap.org/data/2.5/air_pollution?lat=${lat}&lon=${lon}&appid=${process.env.OWM_KEY}`,

@@ -6,11 +6,15 @@ import MapView from "../components/map/MapView";
 
 import LocationOverview from "../components/location/LocationOverview";
 import InsightsSection from "../components/location/InsightsSection";
+import AreaChatbot from "../components/location/AreaChatbot";
 
 import useLocationOverview from "../hooks/useLocationOverview";
+import { useLocationStore } from "../features/location/location.store";
 
 export default function MainApp() {
   useLocationOverview();
+
+  const chatbotData = useLocationStore((state) => state.chatbotData);
 
   return (
     <>
@@ -24,6 +28,9 @@ export default function MainApp() {
       />
 
       <InsightsSection />
+
+      {chatbotData && <AreaChatbot chatbotData={chatbotData} />}
+
       <AuthModal />
     </>
   );

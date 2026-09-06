@@ -8,41 +8,48 @@ export default function useLocationOverview() {
     selectedCoords,
     selectedRadius,
     setOverview,
+    setChatbotData,
     setLoading,
     setError,
   } = useLocationStore();
 
-  const {
-    isAuthenticated,
-    requireAuth,
-    clearAuthRequired,
-  } = useAuthStore();
+  const { isAuthenticated, requireAuth, clearAuthRequired } = useAuthStore();
 
   useEffect(() => {
-    // ❌ Do NOTHING if marker or radius not selected
+    // No marker or radius selected.
     if (!selectedCoords || !selectedRadius) {
       clearAuthRequired();
       return;
     }
 
-    // ❌ Ask auth ONLY after marker + radius
+    // Ask authentication only after marker + radius.
     if (!isAuthenticated) {
       requireAuth();
       return;
     }
 
-    // ✅ User authenticated → fetch insights
+    // Authenticated → fetch AreaLens data.
     setLoading(true);
 
     fetchLocationOverview(
       selectedCoords.lat,
       selectedCoords.lng,
-      selectedRadius
+      selectedRadius,
     )
       .then((data) => {
+        // Existing AreaLens data.
         setOverview(data);
+
+        // New chatbot context for ONLY this area.
+        setChatbotData(data?.chatbotdata ?? null);
       })
-      .catch(() => {
+      .catch((err) => {
+        console.error("Location overview error:", err);
+
+        // If request fails, don't leave chatbot
+        // context from a previous successful request.
+        setChatbotData(null);
+
         setError("Failed to load insights");
       });
   }, [
@@ -52,6 +59,7 @@ export default function useLocationOverview() {
     requireAuth,
     clearAuthRequired,
     setOverview,
+    setChatbotData,
     setLoading,
     setError,
   ]);

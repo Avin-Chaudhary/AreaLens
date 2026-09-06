@@ -19,25 +19,33 @@ const saveToStorage = (state) => {
         selectedCoords: state.selectedCoords,
         selectedRadius: state.selectedRadius,
         overview: state.overview,
-      })
+      }),
     );
-  } catch {}
+  } catch {
+    return null;
+  }
 };
 
 const persisted = loadFromStorage();
 
-export const useLocationStore = create((set, get) => ({
+export const useLocationStore = create((set) => ({
   // ─── Persisted State ───────────────────────────────
   selectedCoords: persisted?.selectedCoords ?? null,
   selectedRadius: persisted?.selectedRadius ?? null,
   overview: persisted?.overview ?? null,
 
+  // ─── Temporary Chatbot State ───────────────────────
+  // Only stores chatbot data for the CURRENT area.
+  // This is intentionally NOT persisted to localStorage.
+  chatbotData: null,
+
   // ─── UI / Control State ────────────────────────────
   loading: false,
   error: null,
-  hasInteracted: false, // 🆕 STEP 1
+  hasInteracted: false,
 
   // ─── Actions ───────────────────────────────────────
+
   setSelectedCoords: (coords) =>
     set((state) => {
       const sameLocation =
@@ -49,10 +57,15 @@ export const useLocationStore = create((set, get) => ({
         selectedCoords: coords,
         selectedRadius: sameLocation ? state.selectedRadius : null,
         overview: null,
+
+        // New location = old chatbot context is invalid.
+        chatbotData: null,
+
         error: null,
       };
 
       saveToStorage({ ...state, ...next });
+
       return next;
     }),
 
@@ -61,10 +74,16 @@ export const useLocationStore = create((set, get) => ({
       const next = {
         selectedRadius: radius,
         overview: null,
+
+        // New radius = new AreaLens request,
+        // therefore old chatbot context must disappear.
+        chatbotData: null,
+
         error: null,
       };
 
       saveToStorage({ ...state, ...next });
+
       return next;
     }),
 
@@ -76,7 +95,19 @@ export const useLocationStore = create((set, get) => ({
       };
 
       saveToStorage({ ...state, ...next });
+
       return next;
+    }),
+
+  // Stores chatbot data only in memory.
+  setChatbotData: (data) =>
+    set({
+      chatbotData: data ?? null,
+    }),
+
+  clearChatbotData: () =>
+    set({
+      chatbotData: null,
     }),
 
   setLoading: (value) =>
@@ -90,22 +121,28 @@ export const useLocationStore = create((set, get) => ({
       loading: false,
     }),
 
-  // 🆕 STEP 1: mark real user interaction
+  // Mark real user interaction.
   setHasInteracted: () =>
     set({
       hasInteracted: true,
     }),
 
   // ─── Reset ─────────────────────────────────────────
+
   clearAll: () => {
     localStorage.removeItem(STORAGE_KEY);
+
     set({
       selectedCoords: null,
       selectedRadius: null,
       overview: null,
+
+      // Also remove temporary chatbot context.
+      chatbotData: null,
+
       loading: false,
       error: null,
-      hasInteracted: false, // 🆕 reset interaction
+      hasInteracted: false,
     });
   },
 }));

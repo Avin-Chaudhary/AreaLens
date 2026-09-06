@@ -42,6 +42,14 @@ const locController = async (req, res) => {
 
     console.log("2)processDataOverpass ran fine!!!");
 
+    const r21 = await locContHelpers.processDataOverpassForChatbot(
+      latitude_C,
+      longitude_C,
+      r1,
+    );
+
+    console.log("2.1)processDataOverpassForChatbot ran fine!!!");
+
     const r3 = await locContHelpers.getCollectedDataAndProcessOwm(
       latitude_C,
       longitude_C,
@@ -78,6 +86,7 @@ const locController = async (req, res) => {
       saved_data: r7,
       ratings: r6.ratings,
       description: r6.overallDescription,
+      chatbotdata: r21,
     });
   } catch (err) {
     console.error("locController error:", err);
