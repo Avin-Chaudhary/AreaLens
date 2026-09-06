@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "dev": "node --env-file=.env.development server.js",
-    "start": "node --env-file=.env.production server.js"
+    "prod": "node --env-file=.env.production server.js",
+    "start": "node server.js"
   },
   "author": "AreaLens",
   "license": "ISC",
