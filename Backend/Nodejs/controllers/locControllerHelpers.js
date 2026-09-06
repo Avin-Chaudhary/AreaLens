@@ -82,9 +82,9 @@ exports.getAreaName = async (lat, lon) => {
 
 const OVERPASS_SERVERS = [
   "https://overpass-api.de/api/interpreter",
-  // "https://overpass.kumi.systems/api/interpreter",
-  // "https://overpass.nchc.org.tw/api/interpreter",
-  // "https://overpass.openstreetmap.ru/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.nchc.org.tw/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter",
 ];
 
 function pickOverpassServer() {
