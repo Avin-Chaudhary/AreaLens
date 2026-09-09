@@ -367,7 +367,7 @@ function MarkdownMessage({ content }) {
   return <div className="break-words">{elements}</div>;
 }
 
-export default function AreaChatbot({ chatbotData }) {
+export default function AreaChatbot({ sessionId }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -385,8 +385,8 @@ export default function AreaChatbot({ chatbotData }) {
   const inputRef = useRef(null);
 
   /*
-   * When chatbotData changes, it means the user selected
-   * a different area.
+   * When sessionId changes, it means the user selected
+   * a different AreaLens analysis.
    *
    * Therefore the previous conversation must disappear.
    */
@@ -394,7 +394,7 @@ export default function AreaChatbot({ chatbotData }) {
     setMessages([]);
     setInput("");
     setLoading(false);
-  }, [chatbotData]);
+  }, [sessionId]);
 
   /*
    * Automatically scroll ONLY the chatbot message container
@@ -422,7 +422,7 @@ export default function AreaChatbot({ chatbotData }) {
   const handleSend = async () => {
     const question = input.trim();
 
-    if (!question || loading || !chatbotData) {
+    if (!question || loading || !sessionId) {
       return;
     }
 
@@ -442,14 +442,15 @@ export default function AreaChatbot({ chatbotData }) {
 
     try {
       /*
-       * React sends:
+       * React sends only:
        *
        * question
-       * current area's chatbotData
+       * sessionId
        *
-       * FastAPI constructs the final LLM prompt.
+       * FastAPI uses the session-specific RAG database
+       * to retrieve the relevant AreaLens information.
        */
-      const response = await sendChatMessage(question, chatbotData);
+      const response = await sendChatMessage(question, sessionId);
 
       /*
        * Support a few common response shapes so the
@@ -507,7 +508,7 @@ export default function AreaChatbot({ chatbotData }) {
     }
   };
 
-  if (!chatbotData) {
+  if (!sessionId) {
     return null;
   }
 

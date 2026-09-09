@@ -14,7 +14,7 @@ import { useLocationStore } from "../features/location/location.store";
 export default function MainApp() {
   useLocationOverview();
 
-  const chatbotData = useLocationStore((state) => state.chatbotData);
+  const sessionId = useLocationStore((state) => state.sessionId);
 
   return (
     <>
@@ -29,7 +29,7 @@ export default function MainApp() {
 
       <InsightsSection />
 
-      {chatbotData && <AreaChatbot chatbotData={chatbotData} />}
+      {sessionId && <AreaChatbot sessionId={sessionId} />}
 
       <AuthModal />
     </>

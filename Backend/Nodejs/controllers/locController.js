@@ -2,21 +2,13 @@ const locContHelpers = require("./locControllerHelpers");
 
 const locController = async (req, res) => {
   console.log(req.query);
+
   const latitude_C = Number(req.query.lat);
   const longitude_C = Number(req.query.lon);
   const distance_radius = Number(req.query.dist);
 
-  /*
-  const api_key = Number(req.query.API_KEY);
-  if (api_key !== 1234) {
-    res.status(400).json({
-      status: "failure",
-      message: "Invalid API KEY",
-    });
-  }
-  */
-
   if (![2000, 5000, 10000].includes(distance_radius)) {
+    console.log("invalid distance value !!!");
     return res.status(400).json({
       status: "failure",
       msgcode: 1011,
@@ -69,7 +61,13 @@ const locController = async (req, res) => {
 
     r5.radius_m = distance_radius;
 
+    // Initialize temporary RAG session
+    const ragSession = await locContHelpers.createRagSession(r21, r5);
+
+    console.log("5.1)RAG session initialized!!!");
+
     const r6 = await locContHelpers.getStarRatingsDescription(r5);
+
     if (sum_news_str != "") {
       r6.overallDescription.news = sum_news_str;
     }
@@ -86,7 +84,9 @@ const locController = async (req, res) => {
       saved_data: r7,
       ratings: r6.ratings,
       description: r6.overallDescription,
-      chatbotdata: r21,
+
+      // React only receives the session ID.
+      session_id: ragSession.session_id,
     });
   } catch (err) {
     console.error("locController error:", err);

@@ -8,7 +8,20 @@ import pandas as pd
 import os
 import json
 import requests
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+
+
+# ============================================================
+# RAG
+# ============================================================
+
+from rag.rag_service import (
+    create_rag_session,
+    retrieve_documents,
+    delete_rag_session,
+    start_cleanup_thread,
+)
 
 
 # ============================================================
@@ -28,7 +41,19 @@ LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL")
 # FASTAPI
 # ============================================================
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Start background thread responsible for deleting
+    # inactive RAG sessions.
+    start_cleanup_thread()
+
+    yield
+
+
+app = FastAPI(
+    lifespan=lifespan
+)
 
 
 app.add_middleware(
@@ -530,15 +555,158 @@ def get_stars_data(payload: RequestInput):
 
 
 # ============================================================
+# AREA LENS RAG SESSION
+# ============================================================
+
+
+class RagSessionRequest(BaseModel):
+
+    session_id: str
+
+    chatbotdata: Any
+
+    areadata: Any
+
+
+@app.post("/rag/session")
+def create_rag_session_endpoint(
+    data: RagSessionRequest,
+):
+
+    if not data.session_id.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Session ID cannot be empty.",
+        )
+
+    try:
+
+        result = create_rag_session(
+            session_id=data.session_id,
+            r21=data.chatbotdata,
+            r5=data.areadata,
+        )
+
+        return result
+
+    except Exception as err:
+
+        print(
+            "RAG session creation error:",
+            err,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create RAG session.",
+        )
+
+
+# ============================================================
+# RAG SEARCH / RETRIEVAL TEST ENDPOINT
+# ============================================================
+
+
+class RagQueryRequest(BaseModel):
+
+    session_id: str
+
+    question: str
+
+    top_k: Optional[int] = 5
+
+
+@app.post("/rag/search")
+def rag_search(
+    data: RagQueryRequest,
+):
+
+    if not data.session_id.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Session ID cannot be empty.",
+        )
+
+    if not data.question.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty.",
+        )
+
+    try:
+
+        documents = retrieve_documents(
+            session_id=data.session_id,
+            question=data.question,
+            top_k=data.top_k,
+        )
+
+        return {
+            "session_id": data.session_id,
+            "question": data.question,
+            "documents": documents,
+        }
+
+    except ValueError as err:
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(err),
+        )
+
+    except Exception as err:
+
+        print(
+            "RAG search error:",
+            err,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="RAG search failed.",
+        )
+
+
+# ============================================================
+# DELETE RAG SESSION
+# ============================================================
+
+
+@app.delete("/rag/session/{session_id}")
+def delete_rag_session_endpoint(
+    session_id: str,
+):
+
+    deleted = delete_rag_session(
+        session_id
+    )
+
+    if not deleted:
+
+        raise HTTPException(
+            status_code=404,
+            detail="RAG session not found.",
+        )
+
+    return {
+        "success": True,
+        "session_id": session_id,
+    }
+
+
+# ============================================================
 # AREA LENS CHATBOT
 # ============================================================
 
 
 class ChatRequest(BaseModel):
 
-    question: str
+    session_id: str
 
-    chatbotdata: Any
+    question: str
 
 
 # ============================================================
@@ -605,27 +773,31 @@ def is_online_model_available():
 
 def build_chatbot_prompt(
     question: str,
-    chatbotdata: Any,
+    retrieved_documents: List[str],
 ) -> str:
 
     # --------------------------------------------------------
-    # Convert chatbot data to compact JSON
+    # Convert retrieved RAG documents into context
     # --------------------------------------------------------
 
-    try:
+    if retrieved_documents:
 
-        chatbot_json = json.dumps(
-            chatbotdata,
-            ensure_ascii=False,
-            separators=(",", ":"),
+        rag_context = "\n\n".join(
+            f"[Document {i + 1}]\n{document}"
+            for i, document in enumerate(
+                retrieved_documents
+            )
         )
 
-    except Exception:
+    else:
 
-        chatbot_json = str(chatbotdata)
+        rag_context = (
+            "No relevant information was retrieved "
+            "from the AreaLens database."
+        )
 
     # --------------------------------------------------------
-    # Stateless prompt
+    # RAG prompt
     # --------------------------------------------------------
 
     prompt = f"""
@@ -635,12 +807,14 @@ AreaLens application.
 Your job is to answer the user's question about the
 CURRENTLY SELECTED AREA.
 
-You have been given structured AreaLens data for that
-area below.
+The information below was retrieved from the AreaLens
+knowledge base using semantic search.
 
-================ AREA DATA ================
-{chatbot_json}
-================ END AREA DATA ================
+================ RETRIEVED AREA INFORMATION ================
+
+{rag_context}
+
+================ END RETRIEVED INFORMATION ================
 
 USER QUESTION:
 {question}
@@ -649,23 +823,22 @@ USER QUESTION:
 
 1. Answer the user's question directly and naturally.
 
-2. Use the AreaLens data as your factual source for
-   information about the selected area.
+2. Use the retrieved AreaLens information as your
+   factual source.
 
 3. Do NOT invent places, numbers, distances, facilities,
-   ratings, environmental conditions, or other facts that
-   are not supported by the supplied data.
+   ratings, environmental conditions, or other facts.
 
-4. If the supplied data does not contain enough information
-   to answer something, clearly say that the available
-   AreaLens data does not provide that information.
+4. If the retrieved information does not contain enough
+   information to answer the question, clearly say that
+   the available AreaLens data does not provide that
+   information.
 
-5. If a value represents unavailable information, such as
-   -1, null, Infinity, or a missing field, treat it as
-   unavailable rather than as a real value.
+5. You may perform simple reasoning and comparisons using
+   the retrieved numbers.
 
-6. You may perform simple reasoning and comparisons using
-   the supplied numbers.
+6. If multiple retrieved documents contain relevant
+   information, combine them logically.
 
 7. Do not claim that you personally searched Google Maps,
    the internet, news websites, or other external sources.
@@ -673,18 +846,6 @@ USER QUESTION:
 8. Keep answers concise but useful.
 
 9. Use Markdown formatting when appropriate.
-
-   For example:
-
-   ## Heading
-
-   **Important point**
-
-   - Item one
-   - Item two
-
-   1. First
-   2. Second
 
 10. If the user asks something unrelated to the selected
     area, politely explain that you are currently an
@@ -706,7 +867,7 @@ Answer the user now.
 
 def chat_local(
     question: str,
-    chatbotdata: Any,
+    retrieved_documents: List[str],
 ):
 
     """
@@ -750,9 +911,9 @@ def chat_local(
         )
 
     prompt = build_chatbot_prompt(
-        question,
-        chatbotdata,
-    )
+    question,
+    retrieved_documents,
+            )
 
     payload = {
 
@@ -865,12 +1026,12 @@ def chat_local(
 
 def chat_gemini(
     question: str,
-    chatbotdata: Any,
+    retrieved_documents: List[str],
 ):
 
     prompt = build_chatbot_prompt(
         question,
-        chatbotdata,
+        retrieved_documents,
     )
 
     payload = {
@@ -965,13 +1126,9 @@ def chat_gemini(
         )
 
         answer = "".join(
-
             part.get("text", "")
-
             for part in answer_parts
-
             if isinstance(part, dict)
-
         ).strip()
 
         if not answer:
@@ -993,8 +1150,7 @@ def chat_gemini(
         raise RuntimeError(
             "Invalid response received from Gemini."
         )
-
-
+    
 # ============================================================
 # CHATBOT MAIN ROUTER
 # ============================================================
@@ -1002,34 +1158,75 @@ def chat_gemini(
 
 def answer_chatbot(
     question: str,
-    chatbotdata: Any,
+    session_id: str,
 ):
 
     """
-    Model priority:
+    RAG chatbot flow:
 
-        1. Local LLM
-        2. Gemini
-        3. Error
-
-    This keeps the chatbot completely stateless.
+        session_id + question
+                ↓
+        Chroma semantic search
+                ↓
+        relevant documents
+                ↓
+        Local LLM
+                ↓
+        Gemini fallback
+                ↓
+              answer
     """
 
     # --------------------------------------------------------
-    # 1. LOCAL MODEL
+    # 1. Retrieve relevant information from RAG
+    # --------------------------------------------------------
+
+    try:
+
+        retrieved_documents = retrieve_documents(
+            session_id=session_id,
+            question=question,
+            top_k=5,
+        )
+
+    except ValueError as err:
+
+        # Session doesn't exist or has expired.
+
+        raise err
+
+    except Exception as err:
+
+        print(
+            "RAG retrieval failed:",
+            err,
+        )
+
+        raise RuntimeError(
+            "Could not retrieve information "
+            "from the AreaLens knowledge base."
+        )
+
+    print(
+        f"RAG retrieved {len(retrieved_documents)} "
+        f"documents for session {session_id}"
+    )
+
+    # --------------------------------------------------------
+    # 2. LOCAL MODEL
     # --------------------------------------------------------
 
     if is_local_model_running():
 
         print(
-            "AreaLens Chatbot: Using Local LLM"
+            "AreaLens Chatbot: Using Local LLM with RAG"
         )
 
         try:
 
             return chat_local(
                 question,
-                chatbotdata,
+                retrieved_documents,
             )
 
         except Exception as err:
@@ -1040,8 +1237,7 @@ def answer_chatbot(
             )
 
             # ------------------------------------------------
-            # If local server is running but the actual
-            # request fails, try Gemini if available.
+            # Local failed → Gemini fallback
             # ------------------------------------------------
 
             if is_online_model_available():
@@ -1053,37 +1249,34 @@ def answer_chatbot(
 
                 return chat_gemini(
                     question,
-                    chatbotdata,
+                    retrieved_documents,
                 )
 
             raise
 
-
     # --------------------------------------------------------
-    # 2. ONLINE GEMINI
+    # 3. GEMINI
     # --------------------------------------------------------
 
     if is_online_model_available():
 
         print(
-            "AreaLens Chatbot: Using Gemini"
+            "AreaLens Chatbot: Using Gemini with RAG"
         )
 
         return chat_gemini(
             question,
-            chatbotdata,
+            retrieved_documents,
         )
 
-
     # --------------------------------------------------------
-    # 3. NOTHING AVAILABLE
+    # 4. NOTHING AVAILABLE
     # --------------------------------------------------------
 
     raise RuntimeError(
         "No chatbot model is available. "
         "Start the local LLM or configure Gemini."
     )
-
 
 # ============================================================
 # CHAT ENDPOINT
@@ -1092,6 +1285,17 @@ def answer_chatbot(
 
 @app.post("/chat")
 def chat(data: ChatRequest):
+
+    # --------------------------------------------------------
+    # Validate session ID
+    # --------------------------------------------------------
+
+    if not data.session_id.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Session ID cannot be empty.",
+        )
 
     # --------------------------------------------------------
     # Validate question
@@ -1105,25 +1309,21 @@ def chat(data: ChatRequest):
         )
 
     # --------------------------------------------------------
-    # Validate chatbot data
-    # --------------------------------------------------------
-
-    if data.chatbotdata is None:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Chatbot area data is missing.",
-        )
-
-    # --------------------------------------------------------
-    # Stateless chatbot request
+    # RAG + LLM
     # --------------------------------------------------------
 
     try:
 
         answer = answer_chatbot(
-            data.question,
-            data.chatbotdata,
+            question=data.question,
+            session_id=data.session_id,
+        )
+
+    except ValueError as err:
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(err),
         )
 
     except Exception as err:
@@ -1139,9 +1339,10 @@ def chat(data: ChatRequest):
         )
 
     # --------------------------------------------------------
-    # Return to React
+    # Return answer
     # --------------------------------------------------------
 
     return {
         "answer": answer,
+        "session_id": data.session_id,
     }

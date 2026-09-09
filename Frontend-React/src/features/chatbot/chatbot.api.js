@@ -1,19 +1,23 @@
 const FASTAPI_URL = import.meta.env.VITE_FASTAPI_URL;
 
 /**
- * Send a question and the current AreaLens chatbot data
- * to the FastAPI chatbot backend.
+ * Send a question to the FastAPI chatbot backend.
  *
- * React sends the data.
- * FastAPI is responsible for constructing the actual LLM prompt.
+ * React sends only:
+ *
+ * - question
+ * - session_id
+ *
+ * The AreaLens data itself is already stored in the
+ * session-specific RAG database on the FastAPI side.
  */
-export const sendChatMessage = async (question, chatbotData) => {
+export const sendChatMessage = async (question, sessionId) => {
   if (!question || !question.trim()) {
     throw new Error("Question cannot be empty");
   }
 
-  if (!chatbotData) {
-    throw new Error("No AreaLens chatbot data available");
+  if (!sessionId) {
+    throw new Error("No AreaLens session available");
   }
 
   const res = await fetch(`${FASTAPI_URL}/chat`, {
@@ -25,7 +29,7 @@ export const sendChatMessage = async (question, chatbotData) => {
 
     body: JSON.stringify({
       question: question.trim(),
-      chatbotdata: chatbotData,
+      session_id: sessionId,
     }),
   });
 
@@ -38,6 +42,10 @@ export const sendChatMessage = async (question, chatbotData) => {
       if (errorData?.detail) {
         message =
           typeof errorData.detail === "string" ? errorData.detail : message;
+      }
+
+      if (errorData?.message) {
+        message = errorData.message;
       }
     } catch {
       // Keep default error message.

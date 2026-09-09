@@ -1,4 +1,5 @@
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const Tdata = require("./../models/locModel");
 const Parser = require("rss-parser");
@@ -1247,5 +1248,43 @@ exports.getNewsAndUpdateObject = async (area_name, data_obj) => {
       data_obj,
       news_summary: "",
     };
+  }
+};
+
+exports.createRagSession = async (r21, r5) => {
+  const session_id = crypto.randomUUID();
+
+  try {
+    const response = await fetch(`${process.env.FASTAPI_PY_URL}/rag/session`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        session_id,
+        chatbotdata: r21,
+        areadata: r5,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      console.error("RAG session creation failed:", response.status, errorText);
+
+      throw new Error("Failed to initialize RAG session");
+    }
+
+    const result = await response.json();
+
+    console.log("RAG session initialized successfully:", session_id);
+
+    return {
+      session_id,
+      result,
+    };
+  } catch (err) {
+    console.error("createRagSession error:", err.message);
+    throw err;
   }
 };

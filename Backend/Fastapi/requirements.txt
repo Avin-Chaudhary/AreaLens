@@ -6,3 +6,5 @@ joblib
 numpy
 requests
 python-dotenv
+chromadb
+sentence-transformers

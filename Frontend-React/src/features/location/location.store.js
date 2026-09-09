@@ -30,16 +30,19 @@ const persisted = loadFromStorage();
 
 export const useLocationStore = create((set) => ({
   // ─── Persisted State ───────────────────────────────
+
   selectedCoords: persisted?.selectedCoords ?? null,
   selectedRadius: persisted?.selectedRadius ?? null,
   overview: persisted?.overview ?? null,
 
-  // ─── Temporary Chatbot State ───────────────────────
-  // Only stores chatbot data for the CURRENT area.
-  // This is intentionally NOT persisted to localStorage.
-  chatbotData: null,
+  // ─── Temporary Chatbot / RAG State ─────────────────
+
+  // Session ID belongs to the currently selected area.
+  // It is intentionally NOT persisted to localStorage.
+  sessionId: null,
 
   // ─── UI / Control State ────────────────────────────
+
   loading: false,
   error: null,
   hasInteracted: false,
@@ -55,11 +58,13 @@ export const useLocationStore = create((set) => ({
 
       const next = {
         selectedCoords: coords,
+
         selectedRadius: sameLocation ? state.selectedRadius : null,
+
         overview: null,
 
-        // New location = old chatbot context is invalid.
-        chatbotData: null,
+        // New location = old RAG session is no longer valid.
+        sessionId: null,
 
         error: null,
       };
@@ -73,11 +78,12 @@ export const useLocationStore = create((set) => ({
     set((state) => {
       const next = {
         selectedRadius: radius,
+
         overview: null,
 
-        // New radius = new AreaLens request,
-        // therefore old chatbot context must disappear.
-        chatbotData: null,
+        // New radius = new AreaLens analysis,
+        // therefore create/use a new RAG session.
+        sessionId: null,
 
         error: null,
       };
@@ -99,15 +105,15 @@ export const useLocationStore = create((set) => ({
       return next;
     }),
 
-  // Stores chatbot data only in memory.
-  setChatbotData: (data) =>
+  // Stores the temporary RAG session ID.
+  setSessionId: (sessionId) =>
     set({
-      chatbotData: data ?? null,
+      sessionId: sessionId ?? null,
     }),
 
-  clearChatbotData: () =>
+  clearSessionId: () =>
     set({
-      chatbotData: null,
+      sessionId: null,
     }),
 
   setLoading: (value) =>
@@ -137,8 +143,8 @@ export const useLocationStore = create((set) => ({
       selectedRadius: null,
       overview: null,
 
-      // Also remove temporary chatbot context.
-      chatbotData: null,
+      // Remove the temporary RAG session.
+      sessionId: null,
 
       loading: false,
       error: null,

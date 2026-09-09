@@ -8,7 +8,7 @@ export default function useLocationOverview() {
     selectedCoords,
     selectedRadius,
     setOverview,
-    setChatbotData,
+    setSessionId,
     setLoading,
     setError,
   } = useLocationStore();
@@ -29,6 +29,11 @@ export default function useLocationOverview() {
     }
 
     // Authenticated → fetch AreaLens data.
+    //
+    // Node will:
+    // 1. Collect/process the AreaLens data.
+    // 2. Create the temporary RAG session.
+    // 3. Return the session_id along with the normal overview data.
     setLoading(true);
 
     fetchLocationOverview(
@@ -40,15 +45,17 @@ export default function useLocationOverview() {
         // Existing AreaLens data.
         setOverview(data);
 
-        // New chatbot context for ONLY this area.
-        setChatbotData(data?.chatbotdata ?? null);
+        // Store ONLY the session ID for chatbot/RAG.
+        //
+        // React does not need to receive or store chatbotdata anymore.
+        setSessionId(data?.session_id ?? null);
       })
       .catch((err) => {
         console.error("Location overview error:", err);
 
-        // If request fails, don't leave chatbot
-        // context from a previous successful request.
-        setChatbotData(null);
+        // If the AreaLens request fails,
+        // don't keep a previous RAG session alive in React.
+        setSessionId(null);
 
         setError("Failed to load insights");
       });
@@ -59,7 +66,7 @@ export default function useLocationOverview() {
     requireAuth,
     clearAuthRequired,
     setOverview,
-    setChatbotData,
+    setSessionId,
     setLoading,
     setError,
   ]);
