@@ -1,19 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib
-from typing import Optional, Any
-from typing import List
+from typing import Optional, Any, List
 import math
-import pandas as pd
 import os
-import json
 import requests
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
 
 # ============================================================
-# RAG
+# RAG IMPORTS
 # ============================================================
 
 from rag.rag_service import (
@@ -43,6 +39,9 @@ LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Start background services when FastAPI starts.
+    """
 
     # Start background thread responsible for deleting
     # inactive RAG sessions.
@@ -56,11 +55,20 @@ app = FastAPI(
 )
 
 
+# ============================================================
+# CORS
+# ============================================================
+
+frontend_url = os.getenv("FRONTEND_URL")
+
+allowed_origins = []
+
+if frontend_url:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL")
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,9 +91,15 @@ def predict(data: NewsInput):
     return predict_news(data.news)
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
 # ============================================================
@@ -98,7 +112,9 @@ from modelControllers.ml10000Controller import getStarsValue10000
 
 
 def _is_infinite(val):
-    """Helper to detect infinity coming from Node in any form."""
+    """
+    Helper to detect infinity coming from Node in any form.
+    """
 
     if val is None:
         return True
@@ -118,6 +134,10 @@ def _is_infinite(val):
 
 
 def preprocess_payload(data: dict) -> dict:
+    """
+    Preprocess input values before passing them to the
+    trained star-rating models.
+    """
 
     INF_REPLACEMENT_DISTANCES = {
         "railway_station_distance_km": 25,
@@ -133,48 +153,64 @@ def preprocess_payload(data: dict) -> dict:
 
     cleaned = dict(data)
 
+    # --------------------------------------------------------
+    # Distance preprocessing
+    # --------------------------------------------------------
+
     for col, max_val in INF_REPLACEMENT_DISTANCES.items():
 
-        if col in cleaned:
+        if col not in cleaned:
+            continue
 
-            val = cleaned[col]
+        val = cleaned[col]
 
-            if _is_infinite(val):
+        if _is_infinite(val):
+            val = max_val
+        else:
+            try:
+                val = float(val)
+            except Exception:
                 val = max_val
 
-            else:
-                try:
-                    val = float(val)
-                except Exception:
-                    val = max_val
+        cleaned[col] = -val
 
-            cleaned[col] = -val
+    # --------------------------------------------------------
+    # AQI preprocessing
+    # --------------------------------------------------------
 
     if "aqi" in cleaned and cleaned["aqi"] is not None:
-
         try:
             cleaned["aqi"] = -float(cleaned["aqi"])
-
         except Exception:
             pass
 
-    if "temperature_c" in cleaned and cleaned["temperature_c"] is not None:
+    # --------------------------------------------------------
+    # Temperature preprocessing
+    # --------------------------------------------------------
 
+    if (
+        "temperature_c" in cleaned
+        and cleaned["temperature_c"] is not None
+    ):
         try:
             cleaned["temperature_c"] = -abs(
                 float(cleaned["temperature_c"]) - TEMP_OPT
             )
-
         except Exception:
             pass
 
-    if "humidity_percent" in cleaned and cleaned["humidity_percent"] is not None:
+    # --------------------------------------------------------
+    # Humidity preprocessing
+    # --------------------------------------------------------
 
+    if (
+        "humidity_percent" in cleaned
+        and cleaned["humidity_percent"] is not None
+    ):
         try:
             cleaned["humidity_percent"] = -abs(
                 float(cleaned["humidity_percent"]) - HUMIDITY_OPT
             )
-
         except Exception:
             pass
 
@@ -182,6 +218,9 @@ def preprocess_payload(data: dict) -> dict:
 
 
 def _is_valid(val):
+    """
+    Check whether a value is valid for description generation.
+    """
 
     if val is None:
         return False
@@ -193,6 +232,9 @@ def _is_valid(val):
 
 
 def generate_area_description(data: dict) -> dict:
+    """
+    Generate natural-language descriptions for the selected area.
+    """
 
     def valid(v):
         return v is not None and v != -1
@@ -222,7 +264,6 @@ def generate_area_description(data: dict) -> dict:
         )
 
     if transport:
-
         prefix = (
             f"Within a {radius_km:.0f} km radius, "
             f"the area offers access to "
@@ -236,19 +277,16 @@ def generate_area_description(data: dict) -> dict:
             + " and ".join(transport)
             + "."
         )
-
     else:
         transport_desc = ""
 
     if valid(data.get("railway_station_distance_km")):
-
         transport_desc += (
             f" The nearest railway station is approximately "
             f"{data['railway_station_distance_km']:.2f} km away."
         )
 
     if valid(data.get("airport_distance_km")):
-
         transport_desc += (
             f" The nearest airport is about "
             f"{data['airport_distance_km']:.0f} km from the location."
@@ -276,7 +314,6 @@ def generate_area_description(data: dict) -> dict:
         )
 
     if basics:
-
         prefix = (
             f"Essential services within the "
             f"{radius_km:.0f} km area include "
@@ -290,26 +327,22 @@ def generate_area_description(data: dict) -> dict:
             + ", ".join(basics)
             + "."
         )
-
     else:
         basics_desc = ""
 
     if valid(data.get("nearest_hospital_distance_km")):
-
         basics_desc += (
             f" The nearest hospital is roughly "
             f"{data['nearest_hospital_distance_km']:.2f} km away."
         )
 
     if valid(data.get("nearest_bank_distance_km")):
-
         basics_desc += (
             f" The closest bank is about "
             f"{data['nearest_bank_distance_km']:.2f} km away."
         )
 
     if valid(data.get("nearest_fire_station_distance_km")):
-
         basics_desc += (
             f" Fire emergency services are available "
             f"with the nearest station approximately "
@@ -348,7 +381,6 @@ def generate_area_description(data: dict) -> dict:
         )
 
     if comfort_items:
-
         prefix = (
             f"Within the {radius_km:.0f} km radius, "
             f"residents can enjoy "
@@ -367,7 +399,6 @@ def generate_area_description(data: dict) -> dict:
             )
             + "."
         )
-
     else:
         comfort_desc = ""
 
@@ -380,19 +411,16 @@ def generate_area_description(data: dict) -> dict:
     if valid(data.get("aqi")):
 
         if data["aqi"] <= 2:
-
             environment.append(
                 "Air quality in the area is generally good."
             )
 
         elif data["aqi"] == 3:
-
             environment.append(
                 "Air quality levels are moderate."
             )
 
         else:
-
             environment.append(
                 "The area experiences relatively poor air quality."
             )
@@ -401,7 +429,6 @@ def generate_area_description(data: dict) -> dict:
         valid(data.get("temperature_c"))
         and valid(data.get("humidity_percent"))
     ):
-
         environment.append(
             f"The local climate typically sees temperatures around "
             f"{data['temperature_c']:.1f}°C with humidity near "
@@ -417,53 +444,44 @@ def generate_area_description(data: dict) -> dict:
     news_sentences = []
 
     if data.get("news_is_safe") == 1:
-
         news_sentences.append(
             "Recent news coverage generally portrays "
             "the area as safe and stable."
         )
 
     elif data.get("news_is_safe") == 0:
-
         news_sentences.append(
             "Some recent news reports raise concerns "
             "related to safety in the area."
         )
 
     if data.get("news_is_clean") == 1:
-
         news_sentences.append(
             "Cleanliness and civic maintenance have been "
             "highlighted positively in news reports."
         )
 
     elif data.get("news_is_clean") == 0:
-
         news_sentences.append(
             "There are occasional news mentions of "
             "cleanliness-related challenges."
         )
 
     if data.get("news_is_developing") == 1:
-
         news_sentences.append(
             "Ongoing infrastructure and development activities "
             "are frequently mentioned in recent news."
         )
 
     if data.get("news_is_luxury") == 1:
-
         news_sentences.append(
             "The locality is increasingly being described "
             "as a premium or upscale area."
         )
 
     if news_sentences:
-
         news_desc = " ".join(news_sentences)
-
     else:
-
         news_desc = (
             "There is currently limited or neutral news coverage "
             "that significantly influences the overall perception "
@@ -483,8 +501,11 @@ def generate_area_description(data: dict) -> dict:
     }
 
 
-class RequestInput(BaseModel):
+# ============================================================
+# STARS REQUEST MODEL
+# ============================================================
 
+class RequestInput(BaseModel):
     radius_m: Optional[int] = None
 
     bus_stops_count: Optional[int] = None
@@ -537,15 +558,12 @@ def get_stars_data(payload: RequestInput):
     }
 
     if payload.radius_m == 2000:
-
         stars = getStarsValue2000(clean_data)
 
     elif payload.radius_m == 5000:
-
         stars = getStarsValue5000(clean_data)
 
     elif payload.radius_m == 10000:
-
         stars = getStarsValue10000(clean_data)
 
     return {
@@ -558,13 +576,9 @@ def get_stars_data(payload: RequestInput):
 # AREA LENS RAG SESSION
 # ============================================================
 
-
 class RagSessionRequest(BaseModel):
-
     session_id: str
-
     chatbotdata: Any
-
     areadata: Any
 
 
@@ -574,14 +588,12 @@ def create_rag_session_endpoint(
 ):
 
     if not data.session_id.strip():
-
         raise HTTPException(
             status_code=400,
             detail="Session ID cannot be empty.",
         )
 
     try:
-
         result = create_rag_session(
             session_id=data.session_id,
             r21=data.chatbotdata,
@@ -591,7 +603,6 @@ def create_rag_session_endpoint(
         return result
 
     except Exception as err:
-
         print(
             "RAG session creation error:",
             err,
@@ -607,13 +618,9 @@ def create_rag_session_endpoint(
 # RAG SEARCH / RETRIEVAL TEST ENDPOINT
 # ============================================================
 
-
 class RagQueryRequest(BaseModel):
-
     session_id: str
-
     question: str
-
     top_k: Optional[int] = 5
 
 
@@ -623,21 +630,18 @@ def rag_search(
 ):
 
     if not data.session_id.strip():
-
         raise HTTPException(
             status_code=400,
             detail="Session ID cannot be empty.",
         )
 
     if not data.question.strip():
-
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty.",
         )
 
     try:
-
         documents = retrieve_documents(
             session_id=data.session_id,
             question=data.question,
@@ -651,14 +655,12 @@ def rag_search(
         }
 
     except ValueError as err:
-
         raise HTTPException(
             status_code=404,
             detail=str(err),
         )
 
     except Exception as err:
-
         print(
             "RAG search error:",
             err,
@@ -674,7 +676,6 @@ def rag_search(
 # DELETE RAG SESSION
 # ============================================================
 
-
 @app.delete("/rag/session/{session_id}")
 def delete_rag_session_endpoint(
     session_id: str,
@@ -685,7 +686,6 @@ def delete_rag_session_endpoint(
     )
 
     if not deleted:
-
         raise HTTPException(
             status_code=404,
             detail="RAG session not found.",
@@ -701,11 +701,8 @@ def delete_rag_session_endpoint(
 # AREA LENS CHATBOT
 # ============================================================
 
-
 class ChatRequest(BaseModel):
-
     session_id: str
-
     question: str
 
 
@@ -713,9 +710,7 @@ class ChatRequest(BaseModel):
 # MODEL AVAILABILITY
 # ============================================================
 
-
 def is_local_model_running():
-
     """
     Check whether the local LLM server is currently running.
 
@@ -727,15 +722,12 @@ def is_local_model_running():
     """
 
     if not LOCAL_MODELS_URL:
-
         print(
             "LOCAL_MODELS_URL is not configured."
         )
-
         return False
 
     try:
-
         response = requests.get(
             LOCAL_MODELS_URL,
             timeout=2,
@@ -744,7 +736,6 @@ def is_local_model_running():
         return response.status_code == 200
 
     except Exception as err:
-
         print(
             "Local LLM availability check failed:",
             err,
@@ -754,7 +745,6 @@ def is_local_model_running():
 
 
 def is_online_model_available():
-
     """
     Gemini is considered available when both the API key
     and URL are configured.
@@ -770,7 +760,6 @@ def is_online_model_available():
 # CHATBOT PROMPT
 # ============================================================
 
-
 def build_chatbot_prompt(
     question: str,
     retrieved_documents: List[str],
@@ -781,7 +770,6 @@ def build_chatbot_prompt(
     # --------------------------------------------------------
 
     if retrieved_documents:
-
         rag_context = "\n\n".join(
             f"[Document {i + 1}]\n{document}"
             for i, document in enumerate(
@@ -790,7 +778,6 @@ def build_chatbot_prompt(
         )
 
     else:
-
         rag_context = (
             "No relevant information was retrieved "
             "from the AreaLens database."
@@ -864,63 +851,33 @@ Answer the user now.
 # LOCAL LLM CHAT
 # ============================================================
 
-
 def chat_local(
     question: str,
     retrieved_documents: List[str],
 ):
-
     """
     Send the chatbot request to the local OpenAI-compatible
     LLM server.
-
-    Expected API format:
-
-        POST LOCAL_LLM_URL
-
-        {
-            "model": "...",
-            "messages": [...],
-            "temperature": ...,
-            "max_tokens": ...
-        }
-
-    Expected response:
-
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": "..."
-                    }
-                }
-            ]
-        }
     """
 
     if not LOCAL_LLM_URL:
-
         raise RuntimeError(
             "LOCAL_LLM_URL is not configured."
         )
 
     if not LOCAL_LLM_MODEL:
-
         raise RuntimeError(
             "LOCAL_LLM_MODEL is not configured."
         )
 
     prompt = build_chatbot_prompt(
-    question,
-    retrieved_documents,
-            )
+        question,
+        retrieved_documents,
+    )
 
     payload = {
-
         "model": LOCAL_LLM_MODEL,
-
         "messages": [
-
             {
                 "role": "system",
                 "content": (
@@ -929,21 +886,16 @@ def chat_local(
                     "AreaLens data."
                 ),
             },
-
             {
                 "role": "user",
                 "content": prompt,
             },
-
         ],
-
         "temperature": 0.2,
-
         "max_tokens": 700,
     }
 
     try:
-
         response = requests.post(
             LOCAL_LLM_URL,
             json=payload,
@@ -951,7 +903,6 @@ def chat_local(
         )
 
     except requests.RequestException as err:
-
         print(
             "Local LLM request failed:",
             err,
@@ -962,7 +913,6 @@ def chat_local(
         )
 
     if not response.ok:
-
         print(
             "Local LLM API error:",
             response.status_code,
@@ -974,7 +924,6 @@ def chat_local(
         )
 
     try:
-
         result = response.json()
 
         candidates = result.get(
@@ -983,7 +932,6 @@ def chat_local(
         )
 
         if not candidates:
-
             raise ValueError(
                 "Local LLM returned no choices."
             )
@@ -999,7 +947,6 @@ def chat_local(
         )
 
         if not answer:
-
             raise ValueError(
                 "Local LLM returned an empty response."
             )
@@ -1007,7 +954,6 @@ def chat_local(
         return answer.strip()
 
     except Exception as err:
-
         print(
             "Local LLM response parsing error:",
             err,
@@ -1023,7 +969,6 @@ def chat_local(
 # GEMINI CHAT
 # ============================================================
 
-
 def chat_gemini(
     question: str,
     retrieved_documents: List[str],
@@ -1035,45 +980,28 @@ def chat_gemini(
     )
 
     payload = {
-
         "contents": [
-
             {
-
                 "role": "user",
-
                 "parts": [
-
                     {
                         "text": prompt,
                     }
-
                 ],
-
             }
-
         ],
-
         "generationConfig": {
-
             "temperature": 0.2,
-
             "maxOutputTokens": 700,
-
         },
-
     }
 
     headers = {
-
         "Content-Type": "application/json",
-
         "x-goog-api-key": GEMINI_API_KEY,
-
     }
 
     try:
-
         response = requests.post(
             GEMINI_URL,
             headers=headers,
@@ -1082,7 +1010,6 @@ def chat_gemini(
         )
 
     except requests.RequestException as err:
-
         print(
             "Gemini request failed:",
             err,
@@ -1093,7 +1020,6 @@ def chat_gemini(
         )
 
     if not response.ok:
-
         print(
             "Gemini API error:",
             response.status_code,
@@ -1105,7 +1031,6 @@ def chat_gemini(
         )
 
     try:
-
         result = response.json()
 
         candidates = result.get(
@@ -1114,7 +1039,6 @@ def chat_gemini(
         )
 
         if not candidates:
-
             raise ValueError(
                 "Gemini returned no candidates."
             )
@@ -1132,7 +1056,6 @@ def chat_gemini(
         ).strip()
 
         if not answer:
-
             raise ValueError(
                 "Gemini returned an empty response."
             )
@@ -1140,7 +1063,6 @@ def chat_gemini(
         return answer
 
     except Exception as err:
-
         print(
             "Gemini response parsing error:",
             err,
@@ -1150,17 +1072,16 @@ def chat_gemini(
         raise RuntimeError(
             "Invalid response received from Gemini."
         )
-    
+
+
 # ============================================================
 # CHATBOT MAIN ROUTER
 # ============================================================
-
 
 def answer_chatbot(
     question: str,
     session_id: str,
 ):
-
     """
     RAG chatbot flow:
 
@@ -1174,7 +1095,7 @@ def answer_chatbot(
                 ↓
         Gemini fallback
                 ↓
-              answer
+                answer
     """
 
     # --------------------------------------------------------
@@ -1182,7 +1103,6 @@ def answer_chatbot(
     # --------------------------------------------------------
 
     try:
-
         retrieved_documents = retrieve_documents(
             session_id=session_id,
             question=question,
@@ -1190,13 +1110,10 @@ def answer_chatbot(
         )
 
     except ValueError as err:
-
         # Session doesn't exist or has expired.
-
         raise err
 
     except Exception as err:
-
         print(
             "RAG retrieval failed:",
             err,
@@ -1223,14 +1140,12 @@ def answer_chatbot(
         )
 
         try:
-
             return chat_local(
                 question,
                 retrieved_documents,
             )
 
         except Exception as err:
-
             print(
                 "Local chatbot failed:",
                 err,
@@ -1278,10 +1193,10 @@ def answer_chatbot(
         "Start the local LLM or configure Gemini."
     )
 
+
 # ============================================================
 # CHAT ENDPOINT
 # ============================================================
-
 
 @app.post("/chat")
 def chat(data: ChatRequest):
@@ -1291,7 +1206,6 @@ def chat(data: ChatRequest):
     # --------------------------------------------------------
 
     if not data.session_id.strip():
-
         raise HTTPException(
             status_code=400,
             detail="Session ID cannot be empty.",
@@ -1302,7 +1216,6 @@ def chat(data: ChatRequest):
     # --------------------------------------------------------
 
     if not data.question.strip():
-
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty.",
@@ -1313,21 +1226,18 @@ def chat(data: ChatRequest):
     # --------------------------------------------------------
 
     try:
-
         answer = answer_chatbot(
             question=data.question,
             session_id=data.session_id,
         )
 
     except ValueError as err:
-
         raise HTTPException(
             status_code=404,
             detail=str(err),
         )
 
     except Exception as err:
-
         print(
             "AreaLens chatbot error:",
             err,

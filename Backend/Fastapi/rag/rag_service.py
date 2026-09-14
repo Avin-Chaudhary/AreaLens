@@ -1,990 +1,698 @@
-import time
+"""
+RAG Service for AreaLens
+
+Pipeline:
+1. Receive R21 chatbot data and R5 area data.
+2. Convert the data into LangChain Documents.
+3. Split documents into smaller chunks.
+4. Generate embeddings using HuggingFace.
+5. Store vectors in a session-specific Chroma database.
+6. Retrieve relevant chunks for chatbot questions.
+7. Automatically clean up expired sessions.
+
+Compatible with server.py imports:
+
+    create_rag_session
+    retrieve_documents
+    delete_rag_session
+    start_cleanup_thread
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import shutil
 import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
 
-SESSION_TIMEOUT_SECONDS = 4 * 60
+logger = logging.getLogger(__name__)
 
-# Chroma will keep the vector database on disk.
-# Individual session collections will be deleted after timeout.
-CHROMA_PATH = "./rag_storage"
-
-
-# ============================================================
-# VECTOR DATABASE
-# ============================================================
-
-chroma_client = chromadb.PersistentClient(
-    path=CHROMA_PATH
-)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
-# ============================================================
-# EMBEDDING MODEL
-# ============================================================
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
+BASE_DIR = Path(__file__).resolve().parent
+CHROMA_DIR = BASE_DIR / "chroma_sessions"
+
+# Session expiration time.
+# Example: 3600 seconds = 1 hour.
+SESSION_TTL_SECONDS = 60 * 60
+
+# Cleanup interval.
+# Example: every 10 minutes.
+CLEANUP_INTERVAL_SECONDS = 10 * 60
+
+# Embedding model.
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Chunk configuration.
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 100
+
+# Default number of retrieved documents.
+DEFAULT_TOP_K = 5
 
 
-# ============================================================
-# SESSION REGISTRY
-# ============================================================
+# ---------------------------------------------------------------------
+# Internal session storage
+# ---------------------------------------------------------------------
 
-sessions = {}
+@dataclass
+class RagSession:
+    """
+    Stores the Chroma vector database and last access time
+    for a particular RAG session.
+    """
 
-session_lock = threading.Lock()
+    vectorstore: Chroma
+    last_accessed: float
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+_sessions: dict[str, RagSession] = {}
+
+_sessions_lock = threading.RLock()
+
+_embeddings: HuggingFaceEmbeddings | None = None
+_embeddings_lock = threading.Lock()
+
+_cleanup_thread: threading.Thread | None = None
+_cleanup_stop_event = threading.Event()
+
+
+# ---------------------------------------------------------------------
+# Directory setup
+# ---------------------------------------------------------------------
+
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------
+
+def _get_embeddings() -> HuggingFaceEmbeddings:
+    """
+    Lazily initialize and reuse the HuggingFace embedding model.
+
+    This prevents the embedding model from loading repeatedly
+    for every new RAG session.
+    """
+
+    global _embeddings
+
+    if _embeddings is None:
+        with _embeddings_lock:
+            if _embeddings is None:
+                logger.info(
+                    "Loading HuggingFace embedding model: %s",
+                    EMBEDDING_MODEL_NAME,
+                )
+
+                _embeddings = HuggingFaceEmbeddings(
+                    model_name=EMBEDDING_MODEL_NAME,
+                    model_kwargs={
+                        "device": "cpu",
+                    },
+                    encode_kwargs={
+                        "normalize_embeddings": True,
+                    },
+                )
+
+                logger.info("Embedding model loaded successfully.")
+
+    return _embeddings
+
+
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
+
+def _sanitize_session_id(session_id: str) -> str:
+    """
+    Convert a session ID into a safe directory and Chroma collection name.
+    """
+
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id))
+
+    if not cleaned:
+        cleaned = "default_session"
+
+    return cleaned[:100]
+
+
+def _session_directory(session_id: str) -> Path:
+    """
+    Return the persistent Chroma directory for a session.
+    """
+
+    safe_session_id = _sanitize_session_id(session_id)
+    return CHROMA_DIR / safe_session_id
 
 
 def _collection_name(session_id: str) -> str:
-
-    # Chroma collection names have naming restrictions.
-    # Remove UUID hyphens to keep the name simple.
-
-    clean_id = session_id.replace("-", "")
-
-    return f"session_{clean_id}"
-
-
-def _create_embedding(text: str):
-
-    return embedding_model.encode(
-        text,
-        normalize_embeddings=True,
-    ).tolist()
-
-
-def _is_valid_value(value: Any) -> bool:
-
     """
-    Check whether a value should be inserted into the
-    vector database.
+    Return a valid Chroma collection name.
 
-    None, empty strings and Infinity-like values are ignored.
+    Chroma collection names must follow naming restrictions.
     """
 
-    if value is None:
-        return False
+    safe_session_id = _sanitize_session_id(session_id)
 
-    if isinstance(value, str):
+    collection_name = f"arealens_{safe_session_id}"
 
-        if not value.strip():
-            return False
-
-        if value.lower() in (
-            "inf",
-            "infinity",
-            "+inf",
-            "-inf",
-        ):
-            return False
-
-    return True
+    # Ensure reasonable collection-name length.
+    return collection_name[:180]
 
 
-def _readable_field_name(field: str) -> str:
-
-    return field.replace("_", " ")
-
-
-# ============================================================
-# R21 → DOCUMENTS
-# ============================================================
-
-
-def _build_r21_documents(
-    r21: Any,
-    session_id: str,
-):
+def _convert_data_to_text(data: Any, title: str = "") -> str:
     """
-    Convert AreaLens R21 chatbot data into meaningful
-    documents for semantic search.
+    Convert arbitrary Python data into readable text.
 
-    R21 can contain:
-
-        - location
-        - summary
-        - important distances
-        - places grouped by category
-        - metadata
-
-    Each individual place becomes its own document.
+    Supports:
+    - dictionaries
+    - lists
+    - strings
+    - numbers
+    - booleans
+    - None
+    - nested structures
     """
 
-    documents = []
-    metadatas = []
-    ids = []
+    if data is None:
+        return ""
 
-    if not isinstance(r21, dict):
+    if isinstance(data, str):
+        text = data.strip()
 
-        return documents, metadatas, ids
+        if title and text:
+            return f"{title}\n{text}"
 
+        return text
 
-    # --------------------------------------------------------
-    # LOCATION
-    # --------------------------------------------------------
+    try:
+        serialized = json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        serialized = str(data)
 
-    location = r21.get("location")
+    if title:
+        return f"{title}\n{serialized}"
 
-    if isinstance(location, dict):
-
-        latitude = location.get("latitude")
-        longitude = location.get("longitude")
-
-        if (
-            latitude is not None
-            and longitude is not None
-        ):
-
-            document = (
-                "The selected AreaLens location is at "
-                f"latitude {latitude} and "
-                f"longitude {longitude}."
-            )
-
-            documents.append(document)
-
-            metadatas.append({
-                "session_id": session_id,
-                "category": "location",
-                "source": "r21",
-            })
-
-            ids.append(
-                f"{session_id}_location"
-            )
+    return serialized
 
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
+def _build_documents(r21: Any, r5: Any) -> list[Document]:
+    """
+    Convert R21 and R5 data into LangChain Documents.
 
-    summary = r21.get("summary")
+    R21 generally contains chatbot/question-answer or recommendation
+    information.
 
-    if isinstance(summary, dict):
+    R5 generally contains area/location information.
 
-        summary_parts = []
+    The function is intentionally flexible because the incoming data
+    can be a dictionary, list, string, or nested JSON structure.
+    """
 
-        for key, value in summary.items():
+    documents: list[Document] = []
 
-            if not _is_valid_value(value):
-                continue
+    # -------------------------------------------------------------
+    # R21 document
+    # -------------------------------------------------------------
 
-            readable_key = _readable_field_name(key)
+    if r21 is not None:
+        r21_text = _convert_data_to_text(
+            r21,
+            title="R21 Chatbot Data",
+        )
 
-            summary_parts.append(
-                f"{readable_key}: {value}"
-            )
-
-        if summary_parts:
-
-            document = (
-                "AreaLens location summary:\n"
-                + "\n".join(summary_parts)
-            )
-
-            documents.append(document)
-
-            metadatas.append({
-                "session_id": session_id,
-                "category": "summary",
-                "source": "r21",
-            })
-
-            ids.append(
-                f"{session_id}_summary"
-            )
-
-
-    # --------------------------------------------------------
-    # IMPORTANT DISTANCES
-    # --------------------------------------------------------
-
-    distances = r21.get("important_distances")
-
-    if isinstance(distances, dict):
-
-        distance_counter = 0
-
-        for key, value in distances.items():
-
-            if not _is_valid_value(value):
-                continue
-
-            readable_key = _readable_field_name(key)
-
-            document = (
-                f"The {readable_key} from the selected "
-                f"AreaLens location is {value} km."
-            )
-
-            documents.append(document)
-
-            metadatas.append({
-                "session_id": session_id,
-                "category": "distances",
-                "source": "r21",
-                "distance_type": readable_key,
-            })
-
-            ids.append(
-                f"{session_id}_distance_{distance_counter}"
-            )
-
-            distance_counter += 1
-
-
-    # --------------------------------------------------------
-    # INDIVIDUAL PLACES
-    # --------------------------------------------------------
-
-    places = r21.get("places")
-
-    if isinstance(places, dict):
-
-        place_counter = 0
-
-        for category, category_places in places.items():
-
-            if not isinstance(category_places, list):
-                continue
-
-            for place in category_places:
-
-                if not isinstance(place, dict):
-                    continue
-
-                name = place.get(
-                    "name",
-                    "Unnamed place"
+        if r21_text.strip():
+            documents.append(
+                Document(
+                    page_content=r21_text,
+                    metadata={
+                        "source": "r21",
+                        "document_type": "chatbot_data",
+                    },
                 )
-
-                text_parts = [
-                    f"Category: {category}",
-                    f"Name: {name}",
-                ]
-
-                for key, value in place.items():
-
-                    if key == "name":
-                        continue
-
-                    if not _is_valid_value(value):
-                        continue
-
-                    readable_key = _readable_field_name(key)
-
-                    text_parts.append(
-                        f"{readable_key}: {value}"
-                    )
-
-                document = "\n".join(text_parts)
-
-                documents.append(document)
-
-                metadatas.append({
-                    "session_id": session_id,
-                    "category": str(category),
-                    "source": "r21",
-                    "place_name": str(name),
-                })
-
-                ids.append(
-                    f"{session_id}_place_{place_counter}"
-                )
-
-                place_counter += 1
-
-
-    return documents, metadatas, ids
-
-
-# ============================================================
-# R5 → DOCUMENTS
-# ============================================================
-
-
-def _build_r5_documents(
-    r5: Any,
-    session_id: str,
-):
-    """
-    Convert processed AreaLens R5 data into individual,
-    natural-language documents.
-
-    IMPORTANT:
-
-    We intentionally create ONE document per field instead
-    of ONE document per category.
-
-    Example:
-
-        hospitals_count = 4
-
-    becomes:
-
-        "There are 4 hospitals in the selected area."
-
-    This makes exact factual questions much easier for
-    semantic retrieval.
-    """
-
-    documents = []
-    metadatas = []
-    ids = []
-
-    if not isinstance(r5, dict):
-
-        return documents, metadatas, ids
-
-
-    # ========================================================
-    # TRANSPORT
-    # ========================================================
-
-    transport_fields = {
-
-        "radius_m": (
-            lambda v:
-            f"The AreaLens analysis covers a radius of "
-            f"{float(v) / 1000:.2f} km."
-        ),
-
-        "bus_stops_count": (
-            lambda v:
-            f"There are {v} bus stops in the selected area."
-        ),
-
-        "metro_stations_count": (
-            lambda v:
-            f"There are {v} metro stations in the selected area."
-        ),
-
-        "railway_station_distance_km": (
-            lambda v:
-            f"The nearest railway station is "
-            f"{v} km from the selected location."
-        ),
-
-        "airport_distance_km": (
-            lambda v:
-            f"The nearest airport is "
-            f"{v} km from the selected location."
-        ),
-    }
-
-
-    # ========================================================
-    # BASICS
-    # ========================================================
-
-    basics_fields = {
-
-        "hospitals_count": (
-            lambda v:
-            f"There are {v} hospitals in the selected area."
-        ),
-
-        "nearest_hospital_distance_km": (
-            lambda v:
-            f"The nearest hospital is "
-            f"{v} km from the selected location."
-        ),
-
-        "banks_count": (
-            lambda v:
-            f"There are {v} banks in the selected area."
-        ),
-
-        "nearest_bank_distance_km": (
-            lambda v:
-            f"The nearest bank is "
-            f"{v} km from the selected location."
-        ),
-
-        "police_stations_count": (
-            lambda v:
-            f"There are {v} police stations in the selected area."
-        ),
-
-        "nearest_police_station_distance_km": (
-            lambda v:
-            f"The nearest police station is "
-            f"{v} km from the selected location."
-        ),
-
-        "nearest_fire_station_distance_km": (
-            lambda v:
-            f"The nearest fire station is "
-            f"{v} km from the selected location."
-        ),
-    }
-
-
-    # ========================================================
-    # COMFORT
-    # ========================================================
-
-    comfort_fields = {
-
-        "restaurants_count": (
-            lambda v:
-            f"There are {v} restaurants in the selected area."
-        ),
-
-        "gyms_count": (
-            lambda v:
-            f"There are {v} gyms in the selected area."
-        ),
-
-        "parks_count": (
-            lambda v:
-            f"There are {v} parks in the selected area."
-        ),
-
-        "cinemas_count": (
-            lambda v:
-            f"There are {v} cinemas in the selected area."
-        ),
-
-        "shopping_places_count": (
-            lambda v:
-            f"There are {v} shopping places in the selected area."
-        ),
-    }
-
-
-    # ========================================================
-    # ENVIRONMENT
-    # ========================================================
-
-    environment_fields = {
-
-        "aqi": (
-            lambda v:
-            f"The AQI (Air Quality Index) of the selected "
-            f"area is {v}."
-        ),
-
-        "temperature_c": (
-            lambda v:
-            f"The temperature in the selected area is "
-            f"{v} degrees Celsius."
-        ),
-
-        "humidity_percent": (
-            lambda v:
-            f"The humidity in the selected area is "
-            f"{v}%."
-        ),
-    }
-
-
-    # ========================================================
-    # NEWS
-    # ========================================================
-
-    news_fields = {
-
-        "news_is_safe": (
-            lambda v:
-            f"Recent news safety classification for the "
-            f"selected area is {v}."
-        ),
-
-        "news_is_clean": (
-            lambda v:
-            f"Recent news cleanliness classification for "
-            f"the selected area is {v}."
-        ),
-
-        "news_is_developing": (
-            lambda v:
-            f"Recent news development classification for "
-            f"the selected area is {v}."
-        ),
-
-        "news_is_luxury": (
-            lambda v:
-            f"Recent news luxury-area classification for "
-            f"the selected area is {v}."
-        ),
-    }
-
-
-    groups = {
-
-        "transport": transport_fields,
-
-        "basics": basics_fields,
-
-        "comfort": comfort_fields,
-
-        "environment": environment_fields,
-
-        "news": news_fields,
-    }
-
-
-    # ========================================================
-    # CREATE INDIVIDUAL DOCUMENTS
-    # ========================================================
-
-    document_counter = 0
-
-    for group_name, fields in groups.items():
-
-        for field, sentence_builder in fields.items():
-
-            if field not in r5:
-                continue
-
-            value = r5.get(field)
-
-            if not _is_valid_value(value):
-                continue
-
-            try:
-
-                document = sentence_builder(value)
-
-            except Exception:
-
-                # Fallback in case a value has an unexpected
-                # format.
-
-                readable_field = _readable_field_name(field)
-
-                document = (
-                    f"{readable_field}: {value}"
-                )
-
-            documents.append(document)
-
-            metadatas.append({
-                "session_id": session_id,
-                "category": group_name,
-                "source": "r5",
-                "field": field,
-            })
-
-            ids.append(
-                f"{session_id}_r5_{document_counter}"
             )
 
-            document_counter += 1
+    # -------------------------------------------------------------
+    # R5 document
+    # -------------------------------------------------------------
+
+    if r5 is not None:
+        r5_text = _convert_data_to_text(
+            r5,
+            title="R5 Area Data",
+        )
+
+        if r5_text.strip():
+            documents.append(
+                Document(
+                    page_content=r5_text,
+                    metadata={
+                        "source": "r5",
+                        "document_type": "area_data",
+                    },
+                )
+            )
+
+    return documents
 
 
-    return documents, metadatas, ids
+def _split_documents(documents: list[Document]) -> list[Document]:
+    """
+    Split documents into smaller chunks for embedding and retrieval.
+    """
+
+    if not documents:
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            ", ",
+            " ",
+            "",
+        ],
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    # Add chunk index metadata.
+    for index, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = index
+
+    return chunks
 
 
-# ============================================================
-# CREATE RAG SESSION
-# ============================================================
-
+# ---------------------------------------------------------------------
+# Session creation
+# ---------------------------------------------------------------------
 
 def create_rag_session(
     session_id: str,
     r21: Any,
     r5: Any,
-):
+) -> dict[str, Any]:
     """
-    Create a vector collection for one AreaLens session.
+    Create or replace a RAG session.
 
-    Flow:
+    Parameters:
+        session_id:
+            Session ID received from the frontend.
 
-        r21 + r5
-             ↓
-        meaningful documents
-             ↓
-        embeddings
-             ↓
-        Chroma collection
+        r21:
+            Chatbot-related data.
+
+        r5:
+            Area-related data.
+
+    Returns:
+        JSON-serializable session information.
     """
 
-    collection_name = _collection_name(
-        session_id
+    if not session_id or not str(session_id).strip():
+        raise ValueError("session_id is required.")
+
+    session_id = str(session_id).strip()
+
+    logger.info("Creating RAG session: %s", session_id)
+
+    # Convert input data into documents.
+    documents = _build_documents(
+        r21=r21,
+        r5=r5,
     )
 
-
-    # --------------------------------------------------------
-    # Remove an old collection with the same session ID
-    # --------------------------------------------------------
-
-    try:
-
-        chroma_client.delete_collection(
-            name=collection_name
+    if not documents:
+        raise ValueError(
+            "No valid data was provided for RAG session creation."
         )
 
-    except Exception:
+    # Split documents into chunks.
+    chunks = _split_documents(documents)
 
-        pass
-
-
-    # --------------------------------------------------------
-    # Create new collection
-    # --------------------------------------------------------
-
-    collection = chroma_client.create_collection(
-        name=collection_name,
-        metadata={
-            "session_id": session_id,
-        },
-    )
-
-
-    # --------------------------------------------------------
-    # Convert R21 into documents
-    # --------------------------------------------------------
-
-    (
-        r21_documents,
-        r21_metadatas,
-        r21_ids,
-    ) = _build_r21_documents(
-        r21,
-        session_id,
-    )
-
-
-    # --------------------------------------------------------
-    # Convert R5 into documents
-    # --------------------------------------------------------
-
-    (
-        r5_documents,
-        r5_metadatas,
-        r5_ids,
-    ) = _build_r5_documents(
-        r5,
-        session_id,
-    )
-
-
-    # --------------------------------------------------------
-    # Combine documents
-    # --------------------------------------------------------
-
-    documents = (
-        r21_documents
-        + r5_documents
-    )
-
-    metadatas = (
-        r21_metadatas
-        + r5_metadatas
-    )
-
-    ids = (
-        r21_ids
-        + r5_ids
-    )
-
-
-    # --------------------------------------------------------
-    # Create embeddings
-    # --------------------------------------------------------
-
-    if documents:
-
-        embeddings = embedding_model.encode(
-            documents,
-            normalize_embeddings=True,
-        ).tolist()
-
-
-        # ----------------------------------------------------
-        # Store everything inside Chroma
-        # ----------------------------------------------------
-
-        collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids,
+    if not chunks:
+        raise ValueError(
+            "No text chunks were generated from the supplied data."
         )
 
+    # Remove an existing session if it already exists.
+    delete_rag_session(session_id)
 
-    # --------------------------------------------------------
-    # Register session
-    # --------------------------------------------------------
+    session_path = _session_directory(session_id)
+    session_path.mkdir(parents=True, exist_ok=True)
 
-    with session_lock:
+    embeddings = _get_embeddings()
 
-        sessions[session_id] = {
-            "collection_name": collection_name,
-            "last_accessed": time.time(),
-        }
-
-
-    print(
-        f"RAG session created: {session_id} "
-        f"with {len(documents)} documents"
+    logger.info(
+        "Creating Chroma vector store for session '%s' with %d chunks.",
+        session_id,
+        len(chunks),
     )
 
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=_collection_name(session_id),
+        persist_directory=str(session_path),
+    )
+
+    # Older Chroma versions may require persist().
+    # Newer versions persist automatically.
+    persist_method = getattr(vectorstore, "persist", None)
+
+    if callable(persist_method):
+        try:
+            persist_method()
+        except Exception as exc:
+            logger.debug(
+                "Chroma persist() was not required or failed: %s",
+                exc,
+            )
+
+    with _sessions_lock:
+        _sessions[session_id] = RagSession(
+            vectorstore=vectorstore,
+            last_accessed=time.time(),
+        )
+
+    logger.info(
+        "RAG session '%s' created successfully.",
+        session_id,
+    )
 
     return {
         "success": True,
         "session_id": session_id,
         "documents_created": len(documents),
+        "chunks_created": len(chunks),
+        "embedding_model": EMBEDDING_MODEL_NAME,
     }
 
 
-# ============================================================
-# GET SESSION COLLECTION
-# ============================================================
-
-
-def _get_session_collection(
-    session_id: str,
-):
-    """
-    Get the Chroma collection belonging to a session.
-
-    Every successful access also refreshes the session timeout.
-    """
-
-    with session_lock:
-
-        session = sessions.get(
-            session_id
-        )
-
-        if session is None:
-
-            return None
-
-        # User accessed this session.
-        # Refresh its inactivity timer.
-
-        session["last_accessed"] = time.time()
-
-        collection_name = session[
-            "collection_name"
-        ]
-
-
-    try:
-
-        return chroma_client.get_collection(
-            name=collection_name
-        )
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# RETRIEVE DOCUMENTS
-# ============================================================
-
+# ---------------------------------------------------------------------
+# Document retrieval
+# ---------------------------------------------------------------------
 
 def retrieve_documents(
     session_id: str,
     question: str,
-    top_k: int = 5,
-):
+    top_k: int = DEFAULT_TOP_K,
+) -> list[str]:
     """
-    Perform semantic vector search for a question.
+    Retrieve relevant text chunks for a question.
 
-    Flow:
+    This is the function expected by server.py.
 
-        question
-            ↓
-        embedding
-            ↓
-        Chroma similarity search
-            ↓
-        top_k relevant documents
-    """
+    Parameters:
+        session_id:
+            Existing RAG session ID.
 
-    collection = _get_session_collection(
-        session_id
-    )
+        question:
+            User's question.
 
+        top_k:
+            Number of relevant chunks to retrieve.
 
-    if collection is None:
-
-        raise ValueError(
-            "RAG session not found or expired."
-        )
-
-
-    # --------------------------------------------------------
-    # Convert question into embedding
-    # --------------------------------------------------------
-
-    question_embedding = _create_embedding(
-        question
-    )
-
-
-    # --------------------------------------------------------
-    # Search Chroma
-    # --------------------------------------------------------
-
-    results = collection.query(
-        query_embeddings=[
-            question_embedding
-        ],
-        n_results=top_k,
-    )
-
-
-    documents = results.get(
-        "documents",
-        [[]],
-    )[0]
-
-
-    return documents
-
-
-# ============================================================
-# DELETE SESSION
-# ============================================================
-
-
-def delete_rag_session(
-    session_id: str,
-):
-    """
-    Delete the vector collection and session metadata.
+    Returns:
+        List of relevant chunk texts.
     """
 
-    with session_lock:
+    if not session_id or not str(session_id).strip():
+        raise ValueError("session_id is required.")
 
-        session = sessions.pop(
-            session_id,
-            None,
-        )
+    if not question or not str(question).strip():
+        return []
 
-
-    if session is None:
-
-        return False
-
+    session_id = str(session_id).strip()
 
     try:
+        top_k = int(top_k)
+    except (TypeError, ValueError):
+        top_k = DEFAULT_TOP_K
 
-        chroma_client.delete_collection(
-            name=session["collection_name"]
+    top_k = max(1, min(top_k, 20))
+
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+
+        if session is None:
+            raise ValueError(
+                "RAG session not found or expired."
+            )
+
+        # Update session activity time.
+        session.last_accessed = time.time()
+
+        vectorstore = session.vectorstore
+
+    logger.info(
+        "Retrieving documents for session '%s'. Question: %s",
+        session_id,
+        question,
+    )
+
+    results = vectorstore.similarity_search(
+        query=str(question),
+        k=top_k,
+    )
+
+    retrieved_texts: list[str] = []
+
+    for document in results:
+        if not document or not document.page_content:
+            continue
+
+        retrieved_texts.append(
+            document.page_content.strip()
         )
 
-    except Exception as err:
-
-        print(
-            "Error deleting Chroma collection:",
-            err,
-        )
+    return retrieved_texts
 
 
-    print(
-        f"RAG session deleted: {session_id}"
+def retrieve_relevant_chunks(
+    session_id: str,
+    question: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[str]:
+    """
+    Alias for retrieve_documents().
+
+    This is useful if another module uses the name
+    retrieve_relevant_chunks.
+    """
+
+    return retrieve_documents(
+        session_id=session_id,
+        question=question,
+        top_k=top_k,
     )
 
 
-    return True
+# ---------------------------------------------------------------------
+# Session deletion
+# ---------------------------------------------------------------------
 
-
-# ============================================================
-# CLEANUP EXPIRED SESSIONS
-# ============================================================
-
-
-def cleanup_expired_sessions():
+def delete_rag_session(session_id: str) -> dict[str, Any]:
     """
-    Delete sessions that have been inactive for more than
-    SESSION_TIMEOUT_SECONDS.
+    Delete a RAG session from memory and disk.
+    """
+
+    if not session_id:
+        return {
+            "success": False,
+            "message": "session_id is required.",
+        }
+
+    session_id = str(session_id).strip()
+
+    with _sessions_lock:
+        existed = session_id in _sessions
+
+        _sessions.pop(session_id, None)
+
+    session_path = _session_directory(session_id)
+
+    if session_path.exists():
+        try:
+            shutil.rmtree(session_path)
+            logger.info(
+                "Deleted Chroma directory for session '%s'.",
+                session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not delete Chroma directory for session '%s': %s",
+                session_id,
+                exc,
+            )
+
+    if existed:
+        logger.info(
+            "RAG session '%s' deleted successfully.",
+            session_id,
+        )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "message": "RAG session deleted successfully.",
+        }
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "message": "RAG session did not exist or was already deleted.",
+    }
+
+
+# ---------------------------------------------------------------------
+# Cleanup logic
+# ---------------------------------------------------------------------
+
+def _cleanup_expired_sessions() -> None:
+    """
+    Remove sessions that have not been accessed within the TTL.
     """
 
     current_time = time.time()
+    expired_session_ids: list[str] = []
 
-    expired_sessions = []
+    with _sessions_lock:
+        for session_id, session in _sessions.items():
+            age = current_time - session.last_accessed
 
+            if age > SESSION_TTL_SECONDS:
+                expired_session_ids.append(session_id)
 
-    # --------------------------------------------------------
-    # Find expired sessions
-    # --------------------------------------------------------
-
-    with session_lock:
-
-        for session_id, session in sessions.items():
-
-            last_accessed = session[
-                "last_accessed"
-            ]
-
-            if (
-                current_time - last_accessed
-                > SESSION_TIMEOUT_SECONDS
-            ):
-
-                expired_sessions.append(
-                    session_id
-                )
-
-
-    # --------------------------------------------------------
-    # Delete expired sessions
-    # --------------------------------------------------------
-
-    for session_id in expired_sessions:
-
-        delete_rag_session(
-            session_id
+    for session_id in expired_session_ids:
+        logger.info(
+            "Cleaning up expired RAG session: %s",
+            session_id,
         )
 
-
-# ============================================================
-# BACKGROUND CLEANUP LOOP
-# ============================================================
+        delete_rag_session(session_id)
 
 
-def cleanup_loop():
+def _cleanup_worker() -> None:
+    """
+    Background cleanup worker.
+    """
 
-    while True:
+    logger.info("RAG cleanup thread started.")
 
+    while not _cleanup_stop_event.is_set():
         try:
-
-            cleanup_expired_sessions()
-
-        except Exception as err:
-
-            print(
-                "RAG cleanup error:",
-                err,
+            _cleanup_expired_sessions()
+        except Exception as exc:
+            logger.exception(
+                "Error during RAG session cleanup: %s",
+                exc,
             )
 
-        # Check once every minute.
+        _cleanup_stop_event.wait(
+            CLEANUP_INTERVAL_SECONDS
+        )
 
-        time.sleep(60)
+    logger.info("RAG cleanup thread stopped.")
 
 
-def start_cleanup_thread():
+def start_cleanup_thread() -> None:
+    """
+    Start the background cleanup thread.
 
-    thread = threading.Thread(
-        target=cleanup_loop,
+    This function is safe to call multiple times.
+    """
+
+    global _cleanup_thread
+
+    if (
+        _cleanup_thread is not None
+        and _cleanup_thread.is_alive()
+    ):
+        logger.debug(
+            "RAG cleanup thread is already running."
+        )
+        return
+
+    _cleanup_stop_event.clear()
+
+    _cleanup_thread = threading.Thread(
+        target=_cleanup_worker,
+        name="rag-session-cleanup",
         daemon=True,
     )
 
-    thread.start()
+    _cleanup_thread.start()
 
-    print(
-        "RAG session cleanup thread started."
-    )
+    logger.info("RAG cleanup thread initialized.")
+
+
+def stop_cleanup_thread() -> None:
+    """
+    Stop the background cleanup thread.
+
+    Optional utility function for testing or shutdown handling.
+    """
+
+    _cleanup_stop_event.set()
+
+
+# ---------------------------------------------------------------------
+# Optional inspection helper
+# ---------------------------------------------------------------------
+
+def get_rag_session_info() -> list[dict[str, Any]]:
+    """
+    Return basic information about currently active sessions.
+
+    Useful for debugging.
+    """
+
+    current_time = time.time()
+    session_info: list[dict[str, Any]] = []
+
+    with _sessions_lock:
+        for session_id, session in _sessions.items():
+            session_info.append(
+                {
+                    "session_id": session_id,
+                    "last_accessed": session.last_accessed,
+                    "age_seconds": round(
+                        current_time - session.last_accessed,
+                        2,
+                    ),
+                }
+            )
+
+    return session_info
