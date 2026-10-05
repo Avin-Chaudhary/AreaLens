@@ -84,3 +84,9 @@ temp/
 # Rag
 # =========================
 rag_storage/
+chroma_sessions
+
+# =========================
+# Development miscellaneous
+# =========================
+dev misc/
